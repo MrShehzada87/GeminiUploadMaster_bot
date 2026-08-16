@@ -110,28 +110,36 @@ async def scrape_and_send(bot: Bot, username: str, limit: int = 10, is_force: bo
             media_group = []
             child_posts = item.get("childPosts", [])
 
-            # FORCE VIDEO SEND IF IT'S A REEL / VIDEO
+            # Single Video/Reel
             if is_video and video_url:
                 try:
                     await bot.send_video(chat_id=TELEGRAM_USER_ID, video=video_url, caption=caption)
                     sent_status = True
                 except Exception:
-                    # Fallback to image if Telegram fails to stream raw video URL
                     img_url = item.get("displayUrl") or item.get("imageUrl")
                     if img_url:
                         await bot.send_photo(chat_id=TELEGRAM_USER_ID, photo=img_url, caption=caption)
                         sent_status = True
 
+            # Multi-media / Carousel Post
             elif child_posts:
-                for child in child_posts[:10]:
+                for idx, child in enumerate(child_posts[:10]):
                     v_url = get_video_url(child)
                     d_url = child.get("displayUrl") or child.get("imageUrl")
-                    if v_url: media_group.append(InputMediaVideo(media=v_url))
-                    elif d_url: media_group.append(InputMediaPhoto(media=d_url))
+                    
+                    # প্রথম এলিমেন্টে ক্যাপশন বসানো
+                    c_text = caption if idx == 0 else None
+                    
+                    if v_url: 
+                        media_group.append(InputMediaVideo(media=v_url, caption=c_text))
+                    elif d_url: 
+                        media_group.append(InputMediaPhoto(media=d_url, caption=c_text))
+
                 if media_group:
-                    media_group[0].caption = caption
                     await bot.send_media_group(chat_id=TELEGRAM_USER_ID, media=media_group)
                     sent_status = True
+
+            # Single Photo
             else:
                 img_url = item.get("displayUrl") or item.get("imageUrl")
                 if img_url:
@@ -217,4 +225,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-    
+        
