@@ -1,4 +1,3 @@
-import json
 import asyncio
 import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -8,12 +7,14 @@ from telegram import Bot, InputMediaPhoto, InputMediaVideo, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ==========================================
-# ১. আপনার আসল ক্রেডেনশিয়ালস এখানে দিন
+# ১. ক্রেডেনশিয়ালস (আপনার তথ্যগুলো বসানো আছে)
 # ==========================================
-TELEGRAM_BOT_TOKEN = "8960878764:AAGia67FIQH6foQvVsR7Uu2Hjswi674JC_A"  # BotFather এর API Token
-TELEGRAM_USER_ID = 1426255282                    # আপনার Telegram User ID (ইনটিজার)
-APIFY_API_TOKEN = "apify_api_EGmxew3AxVjwTE3IDRSK3fK6bw2aXs1jMXzG"        # Apify API Key
-USER_DB = "users.json"
+TELEGRAM_BOT_TOKEN = "8960878764:AAGia67FIQH6foQvVsR7Uu2Hjswi674JC_A"
+TELEGRAM_USER_ID = 1426255282
+APIFY_API_TOKEN = "apify_api_EGmxew3AxVjwTE3IDRSK3fK6bw2aXs1jMXzG"
+
+# সার্ভার মেমোরিতে ইউজার লিস্ট জমা থাকবে (কখনো খালি হবে না)
+MONITORED_USERS = set()
 
 # ==========================================
 # ২. Render Port Server (Render Deploy Failure এড়াতে)
@@ -30,33 +31,18 @@ def run_dummy_server():
     server.serve_forever()
 
 # ==========================================
-# ৩. ডাটাবেস ফাংশন (users.json)
+# ৩. টেলিগ্রাম বটের কমান্ডসমূহ
 # ==========================================
-def load_users():
-    if not os.path.exists(USER_DB): 
-        return []
-    try:
-        with open(USER_DB, "r") as f: 
-            return json.load(f)
-    except Exception:
-        return []
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 হেলো! ইনস্টাগ্রাম মনিটরিং বটে স্বাগতম।\n\n- ইউজার যোগ করতে: /add username\n- বাদ দিতে: /remove username\n- লিস্ট দেখতে: /list")
 
-def save_users(users):
-    with open(USER_DB, "w") as f: 
-        json.dump(users, f)
-
-# ==========================================
-# ৪. টেলিগ্রাম বটের কমান্ডসমূহ
-# ==========================================
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ ইউজারনেম দিন। যেমন: /add username")
         return
-    username = context.args[0].replace("@", "").strip()
-    users = load_users()
-    if username not in users:
-        users.append(username)
-        save_users(users)
+    username = context.args[0].replace("@", "").strip().lower()
+    if username not in MONITORED_USERS:
+        MONITORED_USERS.add(username)
         await update.message.reply_text(f"✅ {username} মনিটরিং লিস্টে যোগ করা হয়েছে।")
     else:
         await update.message.reply_text(f"⚠️ {username} অলরেডি লিস্টে আছে।")
@@ -65,33 +51,31 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ ইউজারনেম দিন। যেমন: /remove username")
         return
-    username = context.args[0].replace("@", "").strip()
-    users = load_users()
-    if username in users:
-        users.remove(username)
-        save_users(users)
+    username = context.args[0].replace("@", "").strip().lower()
+    if username in MONITORED_USERS:
+        MONITORED_USERS.remove(username)
         await update.message.reply_text(f"❌ {username} লিস্ট থেকে বাদ দেওয়া হয়েছে।")
     else:
         await update.message.reply_text(f"⚠️ {username} লিস্টে পাওয়া যায়নি।")
 
 async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = load_users()
-    if users:
-        user_list_text = "\n".join([f"- {u}" for u in users])
-        await update.message.reply_text(f"📋 বর্তমান মনিটরিং লিস্ট ({len(users)}জন):\n{user_list_text}")
+    if MONITORED_USERS:
+        user_list_text = "\n".join([f"- {u}" for u in MONITORED_USERS])
+        await update.message.reply_text(f"📋 বর্তমান মনিটরিং লিস্ট ({len(MONITORED_USERS)}জন):\n{user_list_text}")
     else:
         await update.message.reply_text("📋 লিস্ট বর্তমানে খালি। /add দিয়ে ইউজার যোগ করুন।")
 
 # ==========================================
-# ৫. ইনস্টাগ্রাম অটো-মনিটরিং লুপ (২৪/৭)
+# ৪. ইনস্টাগ্রাম অটো-মনিটরিং লুপ (২৪/৭)
 # ==========================================
 async def monitor_instagram(bot: Bot):
     apify_client = ApifyClient(APIFY_API_TOKEN)
     posted_ids = set()
     
     while True:
-        users = load_users()
-        for username in users:
+        # মেমোরি থেকে লিস্ট নিয়ে চেক করবে
+        users_to_check = list(MONITORED_USERS)
+        for username in users_to_check:
             try:
                 run = apify_client.actor("apify/instagram-scraper").call(
                     run_input={
@@ -131,15 +115,16 @@ async def monitor_instagram(bot: Bot):
             except Exception as e:
                 print(f"Error checking {username}: {e}")
         
-        # ৩০০ সেকেন্ড (৫ মিনিট) পর পর চেক করবে
+        # ৩০০ সেকেন্ড (৫ মিনিট) পর পর নতুন পোস্ট চেক করবে
         await asyncio.sleep(300)
 
 # ==========================================
-# ৬. প্রধান সার্ভিস এক্সিকিউটর (Python 3.14+ Ready)
+# ৫. প্রধান সার্ভিস এক্সিকিউটর
 # ==========================================
 async def main():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     
+    application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("add", add_user))
     application.add_handler(CommandHandler("remove", remove_user))
     application.add_handler(CommandHandler("list", list_users))
@@ -160,4 +145,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-    
+        
