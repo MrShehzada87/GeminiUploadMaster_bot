@@ -70,16 +70,17 @@ def get_video_url(item):
     return None
 
 # --- Scraper Core Logic ---
-async def scrape_and_send(bot: Bot, username: str, limit: int = 10, is_force: bool = False):
+async def scrape_and_send(bot: Bot, username: str, limit: int = 10, is_force: bool = False, skip_sending: bool = False):
     apify_client = ApifyClient(APIFY_API_TOKEN)
     try:
         run = apify_client.actor("apify/instagram-scraper").call(
             run_input={"directUrls": [f"https://www.instagram.com/{username}/"], "resultsLimit": limit}
         )
-        dataset_id = run["defaultDatasetId"] if isinstance(run, dict) else run.default_dataset_id
-        items = apify_client.dataset(dataset_id).list_items().items
+        dataset_id = run.get("defaultDatasetId") if isinstance(run, dict) else getattr(run, "defaultDatasetId", None)
+        if not dataset_id:
+            return
         
-        # Oldest to Newest অর্ডার
+        items = apify_client.dataset(dataset_id).list_items().items
         items.reverse()
         
         if not items and is_force:
@@ -90,6 +91,12 @@ async def scrape_and_send(bot: Bot, username: str, limit: int = 10, is_force: bo
         for item in items:
             post_id = item.get("id") or item.get("shortCode") or item.get("url")
             
+            # যদি নতুন ইউজার এড করার সময় skip_sending ট্রু থাকে, তবে পুরনো পোস্টগুলো শুধু ডাটাবেসে মার্ক করে রাখব কিন্তু টেলিগ্রামে পাঠাব না
+            if skip_sending:
+                if post_id:
+                    mark_post_sent(post_id)
+                continue
+
             if not is_force and post_id and is_post_sent(post_id):
                 continue
             
@@ -110,10 +117,10 @@ async def scrape_and_send(bot: Bot, username: str, limit: int = 10, is_force: bo
             media_group = []
             child_posts = item.get("childPosts", [])
 
-            # Single Video/Reel
+            # Single Video/Reel (Original Quality)
             if is_video and video_url:
                 try:
-                    await bot.send_video(chat_id=TELEGRAM_USER_ID, video=video_url, caption=caption)
+                    await bot.send_video(chat_id=TELEGRAM_USER_ID, video=video_url, caption=caption, supports_streaming=True)
                     sent_status = True
                 except Exception:
                     img_url = item.get("displayUrl") or item.get("imageUrl")
@@ -126,12 +133,10 @@ async def scrape_and_send(bot: Bot, username: str, limit: int = 10, is_force: bo
                 for idx, child in enumerate(child_posts[:10]):
                     v_url = get_video_url(child)
                     d_url = child.get("displayUrl") or child.get("imageUrl")
-                    
-                    # প্রথম এলিমেন্টে ক্যাপশন বসানো
                     c_text = caption if idx == 0 else None
                     
                     if v_url: 
-                        media_group.append(InputMediaVideo(media=v_url, caption=c_text))
+                        media_group.append(InputMediaVideo(media=v_url, caption=c_text, supports_streaming=True))
                     elif d_url: 
                         media_group.append(InputMediaPhoto(media=d_url, caption=c_text))
 
@@ -139,7 +144,7 @@ async def scrape_and_send(bot: Bot, username: str, limit: int = 10, is_force: bo
                     await bot.send_media_group(chat_id=TELEGRAM_USER_ID, media=media_group)
                     sent_status = True
 
-            # Single Photo
+            # Single Photo (Original Quality)
             else:
                 img_url = item.get("displayUrl") or item.get("imageUrl")
                 if img_url:
@@ -151,11 +156,11 @@ async def scrape_and_send(bot: Bot, username: str, limit: int = 10, is_force: bo
                 if post_id:
                     mark_post_sent(post_id)
 
-        if is_force and sent_count == 0:
+        if is_force and not skip_sending and sent_count == 0:
             await bot.send_message(chat_id=TELEGRAM_USER_ID, text="ℹ️ কোনো নতুন মিডিয়া পাওয়া যায়নি।")
 
     except Exception as e:
-        if is_force: 
+        if is_force and not skip_sending: 
             await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"❌ Error: {e}")
 
 # --- Bot Commands ---
@@ -167,8 +172,13 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ ইউজারনেম দিন। যেমন: /add username")
         return
     username = context.args[0].replace("@", "").strip().lower()
+    
+    # নতুন ইউজার যোগ করার সময় তার বর্তমান পুরনো পোস্টগুলো টেলিগ্রামে পাঠানো স্কিপ করে শুধু সিস্টেমে সেভ করে রাখবে
+    await update.message.reply_text(f"⏳ {username} লিস্টে যোগ করা হচ্ছে এবং পুরনো পোস্টগুলো ফিল্টার করা হচ্ছে...")
+    await scrape_and_send(context.bot, username, limit=10, is_force=False, skip_sending=True)
+    
     redis_add_user(username)
-    await update.message.reply_text(f"✅ {username} পারমানেন্ট মনিটরিং লিস্টে যোগ করা হয়েছে।")
+    await update.message.reply_text(f"✅ {username} সাকসেসফুলি মনিটরিং লিস্টে যোগ হয়েছে! এখন থেকে নতুন পোস্ট আসলে শুধু সেটাই পাঠানো হবে।")
 
 async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -192,13 +202,13 @@ async def force_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     username = context.args[0].replace("@", "").strip().lower()
     await update.message.reply_text(f"🔎 <b>{username}</b>-এর সর্বশেষ ১০টি পোস্ট চেক করা হচ্ছে...", parse_mode="HTML")
-    await scrape_and_send(context.bot, username, limit=10, is_force=True)
+    await scrape_and_send(context.bot, username, limit=10, is_force=True, skip_sending=False)
 
 async def monitor_instagram(bot: Bot):
     while True:
         users_to_check = list(redis_get_users())
         for username in users_to_check:
-            await scrape_and_send(bot, username, limit=5, is_force=False)
+            await scrape_and_send(bot, username, limit=5, is_force=False, skip_sending=False)
         await asyncio.sleep(60)
 
 async def main():
