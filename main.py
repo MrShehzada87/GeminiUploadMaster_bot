@@ -86,18 +86,22 @@ async def scrape_and_send(bot: Bot, username: str, limit: int = 5, is_force: boo
                 "resultsLimit": limit
             }
         )
-        items = apify_client.dataset(run["defaultDatasetId"]).list_items().items
+        # Apify Client-এর সঠিক অ্যাট্রিবিউট কলিং
+        dataset_id = run.get("defaultDatasetId") or run.get("default_dataset_id")
+        items = apify_client.dataset(dataset_id).list_items().items
         
         count = len(items)
         if is_force:
-            await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"📊 ডিবাগ টেস্ট: {username} এর {count} টি পোস্ট পাওয়া গেছে।")
+            await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"📊 মোট {count} টি পোস্ট পাওয়া গেছে। প্রসেস করা হচ্ছে...")
         
         if count == 0:
+            if is_force:
+                await bot.send_message(chat_id=TELEGRAM_USER_ID, text="⚠️ কোনো পোস্ট পাওয়া যায়নি (প্রোফাইল প্রাইভেট হতে পারে)।")
             return
 
     except Exception as e:
         if is_force:
-            await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"❌ Apify Error: {e}")
+            await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"❌ Error: {e}")
         return
 
     sent_count = 0
@@ -172,4 +176,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-                     
+        
