@@ -14,30 +14,41 @@ APIFY_API_TOKEN = "apify_api_EGmxew3AxVjwTE3IDRSK3fK6bw2aXs1jMXzG"
 UPSTASH_URL = "https://thorough-lion-149431.upstash.io"
 UPSTASH_TOKEN = "gQAAAAAAAke3AAIgcDE3YWViMDExYWQwM2U0ZWM3OWI3YjI3ZDhjNTg5ZGZiMg"
 
+# --- Redis Helper Functions ---
 def redis_get_users():
     try:
         headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
         res = requests.get(f"{UPSTASH_URL}/smembers/monitored_users", headers=headers, timeout=5).json()
         result = res.get("result", [])
         return set(result) if isinstance(result, list) else set()
-    except Exception as e:
-        print(f"Redis get error: {e}")
-        return set()
+    except Exception: return set()
 
 def redis_add_user(username):
     try:
         headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
         requests.get(f"{UPSTASH_URL}/sadd/monitored_users/{username}", headers=headers)
-    except Exception as e:
-        print(f"Redis add error: {e}")
+    except Exception: pass
 
 def redis_remove_user(username):
     try:
         headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
         requests.get(f"{UPSTASH_URL}/srem/monitored_users/{username}", headers=headers)
-    except Exception as e:
-        print(f"Redis remove error: {e}")
+    except Exception: pass
 
+def is_post_sent(post_id):
+    try:
+        headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+        res = requests.get(f"{UPSTASH_URL}/sismember/sent_posts/{post_id}", headers=headers, timeout=5).json()
+        return res.get("result") == 1
+    except Exception: return False
+
+def mark_post_sent(post_id):
+    try:
+        headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+        requests.get(f"{UPSTASH_URL}/sadd/sent_posts/{post_id}", headers=headers)
+    except Exception: pass
+
+# --- Web Server ---
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -49,6 +60,74 @@ def run_dummy_server():
     server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
     server.serve_forever()
 
+# --- Scraper Core Logic ---
+async def scrape_and_send(bot: Bot, username: str, limit: int = 10, is_force: bool = False):
+    apify_client = ApifyClient(APIFY_API_TOKEN)
+    try:
+        run = apify_client.actor("apify/instagram-scraper").call(
+            run_input={"directUrls": [f"https://www.instagram.com/{username}/"], "resultsLimit": limit}
+        )
+        dataset_id = run["defaultDatasetId"] if isinstance(run, dict) else run.default_dataset_id
+        items = apify_client.dataset(dataset_id).list_items().items
+        
+        # Oldest to Newest অর্ডার
+        items.reverse()
+        
+        if not items and is_force:
+            await bot.send_message(chat_id=TELEGRAM_USER_ID, text="⚠️ কোনো পোস্ট পাওয়া যায়নি।")
+            return
+
+        sent_count = 0
+        for item in items:
+            post_id = item.get("id") or item.get("shortCode") or item.get("url")
+            
+            # Auto-monitoring মোডে থাকলে ডুপ্লিকেট চেকিং করবে, ম্যানুয়াল /check দিলে ফিল্টার ছাড়া ১০টিই পাঠাবে
+            if not is_force and post_id and is_post_sent(post_id):
+                continue
+            
+            post_type = item.get("type", "Post")
+            if post_type == "GraphVideo": post_type = "Reel/Video"
+            elif post_type == "GraphSidecar": post_type = "Carousel Post"
+            
+            caption = f"👤 User: @{username}\n📌 Type: {post_type}"
+            sent_status = False
+
+            # Media Extraction Logic
+            media_group = []
+            child_posts = item.get("childPosts", [])
+
+            if item.get("isVideo") and item.get("videoUrl"):
+                await bot.send_video(chat_id=TELEGRAM_USER_ID, video=item.get("videoUrl"), caption=caption)
+                sent_status = True
+            elif child_posts:
+                for child in child_posts[:10]:
+                    v_url = child.get("videoUrl")
+                    d_url = child.get("displayUrl")
+                    if v_url: media_group.append(InputMediaVideo(media=v_url))
+                    elif d_url: media_group.append(InputMediaPhoto(media=d_url))
+                if media_group:
+                    media_group[0].caption = caption
+                    await bot.send_media_group(chat_id=TELEGRAM_USER_ID, media=media_group)
+                    sent_status = True
+            else:
+                img_url = item.get("displayUrl") or item.get("imageUrl")
+                if img_url:
+                    await bot.send_photo(chat_id=TELEGRAM_USER_ID, photo=img_url, caption=caption)
+                    sent_status = True
+
+            if sent_status:
+                sent_count += 1
+                if post_id:
+                    mark_post_sent(post_id)
+
+        if is_force and sent_count == 0:
+            await bot.send_message(chat_id=TELEGRAM_USER_ID, text="ℹ️ কোনো নতুন মিডিয়া পাওয়া যায়নি।")
+
+    except Exception as e:
+        if is_force: 
+            await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"❌ Error: {e}")
+
+# --- Bot Commands ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 ইনস্টাগ্রাম বট প্রস্তুত!\n\n- /add username\n- /remove username\n- /list\n- /check username")
 
@@ -76,81 +155,21 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("📋 লিস্ট বর্তমানে খালি। /add দিয়ে ইউজার যোগ করুন।")
 
-async def scrape_and_send(bot: Bot, username: str, limit: int = 5, is_force: bool = False):
-    apify_client = ApifyClient(APIFY_API_TOKEN)
-    
-    try:
-        run = apify_client.actor("apify/instagram-scraper").call(
-            run_input={
-                "directUrls": [f"https://www.instagram.com/{username}/"],
-                "resultsLimit": limit
-            }
-        )
-        # Apify Client-এর সঠিক SDK প্রপার্টি
-        dataset_id = run["defaultDatasetId"] if isinstance(run, dict) else run.default_dataset_id
-        items = apify_client.dataset(dataset_id).list_items().items
-        
-        count = len(items)
-        if is_force:
-            await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"📊 মোট {count} টি পোস্ট পাওয়া গেছে। প্রসেস করা হচ্ছে...")
-        
-        if count == 0:
-            if is_force:
-                await bot.send_message(chat_id=TELEGRAM_USER_ID, text="⚠️ কোনো পাবলিক পোস্ট পাওয়া যায়নি।")
-            return
-
-    except Exception as e:
-        if is_force:
-            await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"❌ Apify Error: {e}")
-        return
-
-    sent_count = 0
-    for item in items:
-        media_group = []
-        child_posts = item.get("childPosts", [])
-        images = item.get("images", [])
-        
-        if child_posts:
-            for child in child_posts:
-                v_url = child.get("videoUrl")
-                d_url = child.get("displayUrl")
-                if v_url: media_group.append(InputMediaVideo(media=v_url))
-                elif d_url: media_group.append(InputMediaPhoto(media=d_url))
-        elif images:
-            for img_url in images[:10]: media_group.append(InputMediaPhoto(media=img_url))
-        else:
-            v_url = item.get("videoUrl")
-            d_url = item.get("displayUrl") or item.get("imageUrl") or item.get("url")
-            if item.get("isVideo") and v_url: media_group.append(InputMediaVideo(media=v_url))
-            elif d_url: media_group.append(InputMediaPhoto(media=d_url))
-
-        if media_group:
-            try:
-                if len(media_group) > 1:
-                    await bot.send_media_group(chat_id=TELEGRAM_USER_ID, media=media_group[:10])
-                elif len(media_group) == 1:
-                    if isinstance(media_group[0], InputMediaVideo):
-                        await bot.send_video(chat_id=TELEGRAM_USER_ID, video=media_group[0].media)
-                    else:
-                        await bot.send_photo(chat_id=TELEGRAM_USER_ID, photo=media_group[0].media)
-                sent_count += 1
-            except Exception as send_err:
-                print(f"Send Error: {send_err}")
-
 async def force_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("⚠️ ইউজারনেম দিন। যেমন: /check cristiano")
+        await update.message.reply_text("⚠️ ইউজারনেম দিন। যেমন: /check username")
         return
     username = context.args[0].replace("@", "").strip().lower()
-    await update.message.reply_text(f"🔎 <b>{username}</b> চেক করা হচ্ছে...", parse_mode="HTML")
-    await scrape_and_send(context.bot, username, limit=5, is_force=True)
+    await update.message.reply_text(f"🔎 <b>{username}</b>-এর সর্বশেষ ১০টি পোস্ট ম্যানুয়ালি চেক ও সেন্ড করা হচ্ছে...", parse_mode="HTML")
+    await scrape_and_send(context.bot, username, limit=10, is_force=True)
 
 async def monitor_instagram(bot: Bot):
     while True:
         users_to_check = list(redis_get_users())
         for username in users_to_check:
-            await scrape_and_send(bot, username, limit=3, is_force=False)
-        await asyncio.sleep(300)
+            # অটো মনিটরিংয়ে সর্বশেষ ৫টি চেক করবে এবং শুধু নতুনটা পাঠাবে
+            await scrape_and_send(bot, username, limit=5, is_force=False)
+        await asyncio.sleep(60)  # প্রতি ১ মিনিট পরপর নতুন পোস্ট দ্রুত পাওয়ার জন্য চেক করবে
 
 async def main():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -176,4 +195,3 @@ if __name__ == '__main__':
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
-        
