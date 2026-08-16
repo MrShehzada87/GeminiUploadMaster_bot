@@ -86,22 +86,22 @@ async def scrape_and_send(bot: Bot, username: str, limit: int = 5, is_force: boo
                 "resultsLimit": limit
             }
         )
-        # Apify Client-এর সঠিক অ্যাট্রিবিউট কলিং
-        dataset_id = run.get("defaultDatasetId") or run.get("default_dataset_id")
+        # Apify Client-এর সঠিক SDK প্রপার্টি
+        dataset_id = run["defaultDatasetId"] if isinstance(run, dict) else run.default_dataset_id
         items = apify_client.dataset(dataset_id).list_items().items
         
         count = len(items)
         if is_force:
-            await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"📊 মোট {count} টি পোস্ট পাওয়া গেছে। প্রসেস করা হচ্ছে...")
+            await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"📊 মোট {count} টি পোস্ট পাওয়া গেছে। প্রসেস করা হচ্ছে...")
         
         if count == 0:
             if is_force:
-                await bot.send_message(chat_id=TELEGRAM_USER_ID, text="⚠️ কোনো পোস্ট পাওয়া যায়নি (প্রোফাইল প্রাইভেট হতে পারে)।")
+                await bot.send_message(chat_id=TELEGRAM_USER_ID, text="⚠️ কোনো পাবলিক পোস্ট পাওয়া যায়নি।")
             return
 
     except Exception as e:
         if is_force:
-            await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"❌ Error: {e}")
+            await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"❌ Apify Error: {e}")
         return
 
     sent_count = 0
