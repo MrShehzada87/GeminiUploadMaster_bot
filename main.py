@@ -60,6 +60,15 @@ def run_dummy_server():
     server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
     server.serve_forever()
 
+# --- Helper to Extract Best Video URL ---
+def get_video_url(item):
+    if item.get("videoUrl"): return item.get("videoUrl")
+    if item.get("video_url"): return item.get("video_url")
+    if item.get("videoUrlHD"): return item.get("videoUrlHD")
+    if item.get("videoVersions") and isinstance(item.get("videoVersions"), list) and len(item["videoVersions"]) > 0:
+        return item["videoVersions"][0].get("url")
+    return None
+
 # --- Scraper Core Logic ---
 async def scrape_and_send(bot: Bot, username: str, limit: int = 10, is_force: bool = False):
     apify_client = ApifyClient(APIFY_API_TOKEN)
@@ -81,28 +90,42 @@ async def scrape_and_send(bot: Bot, username: str, limit: int = 10, is_force: bo
         for item in items:
             post_id = item.get("id") or item.get("shortCode") or item.get("url")
             
-            # Auto-monitoring মোডে থাকলে ডুপ্লিকেট চেকিং করবে, ম্যানুয়াল /check দিলে ফিল্টার ছাড়া ১০টিই পাঠাবে
             if not is_force and post_id and is_post_sent(post_id):
                 continue
             
-            post_type = item.get("type", "Post")
-            if post_type == "GraphVideo": post_type = "Reel/Video"
-            elif post_type == "GraphSidecar": post_type = "Carousel Post"
-            
+            raw_type = str(item.get("type", "")).lower()
+            video_url = get_video_url(item)
+            is_video = item.get("isVideo", False) or bool(video_url) or "video" in raw_type or "reel" in raw_type
+
+            if is_video:
+                post_type = "Reel / Video"
+            elif item.get("childPosts"):
+                post_type = "Carousel Post"
+            else:
+                post_type = "Photo"
+
             caption = f"👤 User: @{username}\n📌 Type: {post_type}"
             sent_status = False
 
-            # Media Extraction Logic
             media_group = []
             child_posts = item.get("childPosts", [])
 
-            if item.get("isVideo") and item.get("videoUrl"):
-                await bot.send_video(chat_id=TELEGRAM_USER_ID, video=item.get("videoUrl"), caption=caption)
-                sent_status = True
+            # FORCE VIDEO SEND IF IT'S A REEL / VIDEO
+            if is_video and video_url:
+                try:
+                    await bot.send_video(chat_id=TELEGRAM_USER_ID, video=video_url, caption=caption)
+                    sent_status = True
+                except Exception:
+                    # Fallback to image if Telegram fails to stream raw video URL
+                    img_url = item.get("displayUrl") or item.get("imageUrl")
+                    if img_url:
+                        await bot.send_photo(chat_id=TELEGRAM_USER_ID, photo=img_url, caption=caption)
+                        sent_status = True
+
             elif child_posts:
                 for child in child_posts[:10]:
-                    v_url = child.get("videoUrl")
-                    d_url = child.get("displayUrl")
+                    v_url = get_video_url(child)
+                    d_url = child.get("displayUrl") or child.get("imageUrl")
                     if v_url: media_group.append(InputMediaVideo(media=v_url))
                     elif d_url: media_group.append(InputMediaPhoto(media=d_url))
                 if media_group:
@@ -160,16 +183,15 @@ async def force_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ ইউজারনেম দিন। যেমন: /check username")
         return
     username = context.args[0].replace("@", "").strip().lower()
-    await update.message.reply_text(f"🔎 <b>{username}</b>-এর সর্বশেষ ১০টি পোস্ট ম্যানুয়ালি চেক ও সেন্ড করা হচ্ছে...", parse_mode="HTML")
+    await update.message.reply_text(f"🔎 <b>{username}</b>-এর সর্বশেষ ১০টি পোস্ট চেক করা হচ্ছে...", parse_mode="HTML")
     await scrape_and_send(context.bot, username, limit=10, is_force=True)
 
 async def monitor_instagram(bot: Bot):
     while True:
         users_to_check = list(redis_get_users())
         for username in users_to_check:
-            # অটো মনিটরিংয়ে সর্বশেষ ৫টি চেক করবে এবং শুধু নতুনটা পাঠাবে
             await scrape_and_send(bot, username, limit=5, is_force=False)
-        await asyncio.sleep(60)  # প্রতি ১ মিনিট পরপর নতুন পোস্ট দ্রুত পাওয়ার জন্য চেক করবে
+        await asyncio.sleep(60)
 
 async def main():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
@@ -195,3 +217,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         pass
+    
