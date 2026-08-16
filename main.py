@@ -17,8 +17,9 @@ UPSTASH_TOKEN = "gQAAAAAAAke3AAIgcDE3YWViMDExYWQwM2U0ZWM3OWI3YjI3ZDhjNTg5ZGZiMg"
 def redis_get_users():
     try:
         headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-        res = requests.get(f"{UPSTASH_URL}/smembers/monitored_users", headers=headers).json()
-        return set(res.get("result", []))
+        res = requests.get(f"{UPSTASH_URL}/smembers/monitored_users", headers=headers, timeout=5).json()
+        result = res.get("result", [])
+        return set(result) if isinstance(result, list) else set()
     except Exception as e:
         print(f"Redis get error: {e}")
         return set()
@@ -85,76 +86,84 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("📋 লিস্ট বর্তমানে খালি। /add দিয়ে ইউজার যোগ করুন।")
 
-async def scrape_and_send(bot: Bot, username: str, limit: int = 10, is_force: bool = False):
+async def scrape_and_send(bot: Bot, username: str, limit: int = 5, is_force: bool = False):
     apify_client = ApifyClient(APIFY_API_TOKEN)
     
     try:
-        run_posts = apify_client.actor("apify/instagram-scraper").call(
+        run = apify_client.actor("apify/instagram-scraper").call(
             run_input={
                 "directUrls": [f"https://www.instagram.com/{username}/"],
                 "resultsLimit": limit
             }
         )
-        items = apify_client.dataset(run_posts["defaultDatasetId"]).list_items().items
+        items = apify_client.dataset(run["defaultDatasetId"]).list_items().items
     except Exception as e:
-        print(f"Scrape error: {e}")
-        items = []
+        if is_force:
+            await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"❌ Apify Error: {e}")
+        return
 
+    if not items and is_force:
+        await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"⚠️ {username}-এর কোনো পাবলিক পোস্ট বা মিডিয়া পাওয়া যায়নি (প্রোফাইল প্রাইভেট হতে পারে)।")
+        return
+
+    sent_count = 0
     for item in items:
         media_id = item.get("id") or item.get("url")
-        
-        # ফোর্স চেক হলে আইডি স্কিপ করবে না
         if not is_force and media_id in PROCESSED_IDS:
             continue
 
         media_group = []
 
-        # Album / Carousel Post
-        if item.get("childPosts"):
-            for child in item.get("childPosts", []):
+        # Multi-photo / Album
+        images = item.get("images", [])
+        child_posts = item.get("childPosts", [])
+        
+        if child_posts:
+            for child in child_posts:
                 v_url = child.get("videoUrl")
                 d_url = child.get("displayUrl")
                 if v_url:
                     media_group.append(InputMediaVideo(media=v_url))
                 elif d_url:
                     media_group.append(InputMediaPhoto(media=d_url))
-
-        # Single Media
+        elif images:
+            for img_url in images[:10]:
+                media_group.append(InputMediaPhoto(media=img_url))
         else:
             v_url = item.get("videoUrl")
             d_url = item.get("displayUrl") or item.get("imageUrl") or item.get("url")
-            
             if item.get("isVideo") and v_url:
                 media_group.append(InputMediaVideo(media=v_url))
             elif d_url:
                 media_group.append(InputMediaPhoto(media=d_url))
 
-        # Telegram-এ মিডিয়া সেন্ড করা
         if media_group:
-            chunks = [media_group[i:i + 10] for i in range(0, len(media_group), 10)]
-            for chunk in chunks:
-                try:
-                    if len(chunk) > 1:
-                        await bot.send_media_group(chat_id=TELEGRAM_USER_ID, media=chunk)
-                    elif len(chunk) == 1:
-                        if isinstance(chunk[0], InputMediaVideo):
-                            await bot.send_video(chat_id=TELEGRAM_USER_ID, video=chunk[0].media)
-                        else:
-                            await bot.send_photo(chat_id=TELEGRAM_USER_ID, photo=chunk[0].media)
-                    
-                    if media_id:
-                        PROCESSED_IDS.add(media_id)
-                except Exception as send_err:
-                    print(f"Send Error: {send_err}")
+            try:
+                if len(media_group) > 1:
+                    await bot.send_media_group(chat_id=TELEGRAM_USER_ID, media=media_group[:10])
+                elif len(media_group) == 1:
+                    if isinstance(media_group[0], InputMediaVideo):
+                        await bot.send_video(chat_id=TELEGRAM_USER_ID, video=media_group[0].media)
+                    else:
+                        await bot.send_photo(chat_id=TELEGRAM_USER_ID, photo=media_group[0].media)
+                
+                if media_id:
+                    PROCESSED_IDS.add(media_id)
+                sent_count += 1
+            except Exception as send_err:
+                if is_force:
+                    await bot.send_message(chat_id=TELEGRAM_USER_ID, text=f"⚠️ Telegram Send Error: {send_err}")
+
+    if is_force and sent_count == 0:
+        await bot.send_message(chat_id=TELEGRAM_USER_ID, text="⚠️ মিডিয়া লিঙ্ক পাওয়া গেলেও Telegram-এ সেন্ড করা সম্ভব হয়নি।")
 
 async def force_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("⚠️ ইউজারনেম দিন। যেমন: /check cristiano")
         return
     username = context.args[0].replace("@", "").strip().lower()
-    await update.message.reply_text(f"🔎 <b>{username}</b>-এর পোস্ট ও স্টোরি প্রসেস করা হচ্ছে...", parse_mode="HTML")
-    await scrape_and_send(context.bot, username, limit=10, is_force=True)
-    await update.message.reply_text(f"✅ <b>{username}</b>-এর প্রসেসিং শেষ!", parse_mode="HTML")
+    await update.message.reply_text(f"🔎 <b>{username}</b>-এর মিডিয়া প্রসেস করা হচ্ছে...", parse_mode="HTML")
+    await scrape_and_send(context.bot, username, limit=5, is_force=True)
 
 async def monitor_instagram(bot: Bot):
     while True:
